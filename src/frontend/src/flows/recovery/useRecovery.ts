@@ -1,10 +1,17 @@
 import { promptDeviceAlias } from "$src/components/alias";
 import { displayError } from "$src/components/displayError";
 import { withLoader } from "$src/components/loader";
+import { DOMAIN_COMPATIBILITY } from "$src/featureFlags";
 import { setAnchorUsed } from "$src/storage";
 import { authenticatorAttachmentToKeyType } from "$src/utils/authenticatorAttachment";
-import { LoginFlowResult } from "$src/utils/flowResult";
-import { AuthenticatedConnection, Connection } from "$src/utils/iiConnection";
+import { getCredentialsOrigin } from "$src/utils/credential-devices";
+import {
+  AuthenticatedConnection,
+  Connection,
+  IIWebAuthnIdentity,
+  LoginSuccess,
+} from "$src/utils/iiConnection";
+import { userSupportsWebauthRoR } from "$src/utils/rorSupport";
 import { unknownToString, unreachableLax } from "$src/utils/utils";
 import { constructIdentity } from "$src/utils/webAuthn";
 import {
@@ -13,6 +20,7 @@ import {
   isWebAuthnCancel,
   isWebAuthnDuplicateDevice,
 } from "$src/utils/webAuthnErrorUtils";
+import { nonNullish } from "@dfinity/utils";
 import { html } from "lit-html";
 import { forgotNumber } from "./forgotNumber";
 import { promptRecovery } from "./promptRecovery";
@@ -21,7 +29,7 @@ import { recoverWithPhrase } from "./recoverWith/phrase";
 
 export const useRecovery = async (
   connection: Connection
-): Promise<LoginFlowResult> => {
+): Promise<LoginSuccess | { tag: "canceled" }> => {
   const res = await promptRecovery();
 
   if (res === "forgotten") {
@@ -36,23 +44,25 @@ export const useRecovery = async (
 
   res satisfies "phrase" | "device";
 
-  const op =
-    res === "phrase"
-      ? recoverWithPhrase({
-          connection,
-          message: html`Your recovery phrase includes your Internet Identity
-          number and a unique combination of 24 words that represent your
-          private key`,
-        })
-      : recoverWithDevice({ connection });
+  const op = await (res === "phrase"
+    ? recoverWithPhrase({
+        connection,
+        message: html`Your recovery phrase includes your Internet Identity
+        number and a unique combination of 24 words that represent your private
+        key`,
+      })
+    : recoverWithDevice({ connection }));
 
-  const flowResult = await op;
-
-  if (flowResult.tag === "ok") {
-    await postRecoveryFlow(flowResult);
+  if ("tag" in op) {
+    op satisfies { tag: "canceled" };
+    return { tag: "canceled" };
   }
 
-  return flowResult;
+  op satisfies LoginSuccess;
+
+  await postRecoveryFlow(op);
+
+  return op;
 };
 
 // Show the user that the recovery was successful and offer to enroll a new device
@@ -116,15 +126,31 @@ const enrollAuthenticator = async ({
   userNumber: bigint;
   deviceAlias: string;
 }): Promise<"enrolled" | "error"> => {
-  let newDevice;
+  let newDevice: IIWebAuthnIdentity;
+  let newDeviceOrigin: string | undefined;
   try {
-    newDevice = await withLoader(() =>
-      constructIdentity({
-        devices: async () => {
-          return (await connection.getAnchorInfo()).devices;
-        },
-      })
-    );
+    const newDeviceData = await withLoader(async () => {
+      const devices = (await connection.getAnchorInfo()).devices;
+      const newDeviceOrigin =
+        userSupportsWebauthRoR() && DOMAIN_COMPATIBILITY.isEnabled()
+          ? getCredentialsOrigin({
+              credentials: devices,
+            })
+          : undefined;
+      const rpId = nonNullish(newDeviceOrigin)
+        ? new URL(newDeviceOrigin).hostname
+        : undefined;
+      const newDevice = await constructIdentity({
+        devices,
+        rpId,
+      });
+      return {
+        newDevice,
+        newDeviceOrigin,
+      };
+    });
+    newDevice = newDeviceData.newDevice;
+    newDeviceOrigin = newDeviceData.newDeviceOrigin;
   } catch (error: unknown) {
     if (isWebAuthnDuplicateDevice(error)) {
       await displayDuplicateDeviceError({ primaryButton: "Ok" });
@@ -155,6 +181,7 @@ const enrollAuthenticator = async ({
       { authentication: null },
       newDevice.getPublicKey().toDer(),
       { unprotected: null },
+      newDeviceOrigin ?? window.location.origin,
       newDevice.rawId
     );
   } catch (error: unknown) {

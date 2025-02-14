@@ -1,3 +1,4 @@
+import { CAPTCHA_ENABLED } from "$src/test-e2e/constants";
 import {
   AddDeviceSuccessView,
   AddRemoteDeviceInstructionsView,
@@ -5,7 +6,9 @@ import {
   MainView,
   PinAuthView,
   PinRegistrationView,
-  RecoverView,
+  PromptDeviceAliasView,
+  PromptUserNumberView,
+  RecoverSeedPhraseView,
   RecoveryMethodSelectorView,
   RegisterView,
   WelcomeView,
@@ -14,10 +17,10 @@ import {
 export const FLOWS = {
   register: async function (browser: WebdriverIO.Browser): Promise<string> {
     const registerView = new RegisterView(browser);
-    await registerView.waitForDisplay();
-    await registerView.create();
-    await registerView.waitForRegisterConfirm();
-    await registerView.confirmRegisterConfirm();
+    if (CAPTCHA_ENABLED) {
+      await registerView.waitForRegisterConfirm();
+      await registerView.confirmRegisterConfirm();
+    }
     await registerView.waitForIdentity();
     const userNumber = await registerView.registerGetIdentity();
     await registerView.registerConfirmIdentity();
@@ -53,8 +56,10 @@ export const FLOWS = {
     await pinRegistrationView.setPin(pin);
     await pinRegistrationView.waitForConfirmPin();
     await pinRegistrationView.confirmPin(pin);
-    await registerView.waitForRegisterConfirm();
-    await registerView.confirmRegisterConfirm();
+    if (CAPTCHA_ENABLED) {
+      await registerView.waitForRegisterConfirm();
+      await registerView.confirmRegisterConfirm();
+    }
     await registerView.waitForIdentity();
     const userNumber = await registerView.registerGetIdentity();
     await registerView.registerConfirmIdentity();
@@ -80,16 +85,11 @@ export const FLOWS = {
   },
   loginWelcomeView: async (
     userNumber: string,
-    deviceName: string,
     browser: WebdriverIO.Browser
   ): Promise<void> => {
     const welcomeView = new WelcomeView(browser);
     await welcomeView.waitForDisplay();
     await welcomeView.login(userNumber);
-    // This flow assumes no recovery phrase, so we explicitly skip the recovery nag here
-    await FLOWS.skipRecoveryNag(browser);
-    const mainView = new MainView(browser);
-    await mainView.waitForDeviceDisplay(deviceName);
   },
   loginAuthenticateView: async (
     userNumber: string,
@@ -99,8 +99,17 @@ export const FLOWS = {
     const authenticateView = new AuthenticateView(browser);
     await authenticateView.waitForDisplay();
     await authenticateView.pickAnchor(userNumber);
-    // This flow assumes no recovery phrase, so we explicitly skip the recovery nag here
-    await FLOWS.skipRecoveryNag(browser);
+    const mainView = new MainView(browser);
+    await mainView.waitForDeviceDisplay(deviceName);
+  },
+  loginExistingAuthenticateView: async (
+    userNumber: string,
+    deviceName: string,
+    browser: WebdriverIO.Browser
+  ): Promise<void> => {
+    const authenticateView = new AuthenticateView(browser);
+    await authenticateView.waitForDisplay();
+    await authenticateView.continueWithAnchor(userNumber);
     const mainView = new MainView(browser);
     await mainView.waitForDeviceDisplay(deviceName);
   },
@@ -115,8 +124,6 @@ export const FLOWS = {
     const pinAuthView = new PinAuthView(browser);
     await pinAuthView.waitForDisplay();
     await pinAuthView.enterPin(pin);
-    // This flow assumes no recovery phrase, so we explicitly skip the recovery nag here
-    await FLOWS.skipRecoveryNag(browser);
   },
   loginPinWelcomeView: async (
     userNumber: string,
@@ -129,15 +136,13 @@ export const FLOWS = {
     const pinAuthView = new PinAuthView(browser);
     await pinAuthView.waitForDisplay();
     await pinAuthView.enterPin(pin);
-    // This flow assumes no recovery phrase, so we explicitly skip the recovery nag here
-    await FLOWS.skipRecoveryNag(browser);
   },
   addRecoveryMechanismSeedPhrase: async (
     browser: WebdriverIO.Browser
   ): Promise<string> => {
     const mainView = new MainView(browser);
     await mainView.waitForDisplay();
-    await mainView.addRecovery();
+    await mainView.addRecoverySeedPhrase();
 
     const recoveryMethodSelectorView = new RecoveryMethodSelectorView(browser);
     await recoveryMethodSelectorView.waitForSeedPhrase();
@@ -151,6 +156,19 @@ export const FLOWS = {
     await mainView.waitForDisplay();
 
     return seedPhrase;
+  },
+  addRecoveryMechanismDevice: async (
+    browser: WebdriverIO.Browser
+  ): Promise<void> => {
+    const mainView = new MainView(browser);
+    await mainView.waitForDisplay();
+    await mainView.addRecoveryDevice();
+    await mainView.waitForDisplay();
+    await browser.pause(10_000);
+
+    // Wait for the main view to be displayed again to ensure that the recovery
+    // mechanism was added successfully.
+    await mainView.waitForDisplay();
   },
   readSeedPhrase: async (browser: WebdriverIO.Browser): Promise<string> => {
     const recoveryMethodSelectorView = new RecoveryMethodSelectorView(browser);
@@ -178,21 +196,30 @@ export const FLOWS = {
     await addDeviceSuccessView.waitForDisplay();
     await addDeviceSuccessView.continue();
   },
-  skipRecoveryNag: async (browser: WebdriverIO.Browser): Promise<void> => {
-    const recoveryMethodSelectorView = new RecoveryMethodSelectorView(browser);
-    await recoveryMethodSelectorView.waitForDisplay();
-    await recoveryMethodSelectorView.skipRecovery();
-  },
   recoverUsingSeedPhrase: async (
     browser: WebdriverIO.Browser,
     recoveryPhrase: string
   ): Promise<void> => {
     const authenticateView = new AuthenticateView(browser);
-    await authenticateView.recover();
-    const recoveryView = new RecoverView(browser);
+    await authenticateView.recoverSeedPhrase();
+    const recoveryView = new RecoverSeedPhraseView(browser);
     await recoveryView.waitForSeedInputDisplay();
     await recoveryView.enterSeedPhrase(recoveryPhrase);
     await recoveryView.enterSeedPhraseContinue();
     await recoveryView.skipDeviceEnrollment();
+  },
+  recoverUsingDevice: async (
+    browser: WebdriverIO.Browser,
+    userNumber: string
+  ): Promise<void> => {
+    const authenticateView = new AuthenticateView(browser);
+    await authenticateView.recoverDevice();
+    const userNumberView = new PromptUserNumberView(browser);
+    await userNumberView.waitForUserNumberDisplay();
+    await userNumberView.enterUserNumber(userNumber);
+    await userNumberView.enterUserNumberContinue();
+    const deviceAliasView = new PromptDeviceAliasView(browser);
+    await deviceAliasView.waitForDeviceAliasDisplay();
+    await deviceAliasView.skipDeviceAlias();
   },
 };

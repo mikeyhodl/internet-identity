@@ -5,6 +5,14 @@ import type { IncomingMessage, ServerResponse } from "http";
 import { request } from "undici";
 
 /**
+ * Read the replica port from dfx's local state
+ */
+export const readReplicaPort = (): string => {
+  const stdout = execSync("dfx info webserver-port");
+  return stdout.toString().trim();
+};
+
+/**
  * Read a canister ID from dfx's local state
  */
 export const readCanisterId = ({
@@ -19,6 +27,25 @@ export const readCanisterId = ({
   } catch (e) {
     throw Error(
       `Could not get canister ID for '${canisterName}' with command '${command}', was the canister deployed? ${e}`
+    );
+  }
+};
+
+/**
+ * Read a canister config from dfx's local state
+ */
+export const readCanisterConfig = ({
+  canisterName,
+}: {
+  canisterName: string;
+}): string => {
+  const command = `dfx canister call ${canisterName} config --output raw`;
+  try {
+    const stdout = execSync(command);
+    return Buffer.from(stdout.toString().trim(), "hex").toString("base64");
+  } catch (e) {
+    throw Error(
+      `Could not get canister config for '${canisterName}' with command '${command}', was the canister deployed? ${e}`
     );
   }
 };

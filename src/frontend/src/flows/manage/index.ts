@@ -1,26 +1,30 @@
 import {
   DeviceData,
+  DeviceWithUsage,
   IdentityAnchorInfo,
+  OpenIdCredential,
+  OpenIdCredentialAddError,
+  OpenIdCredentialRemoveError,
 } from "$generated/internet_identity_types";
+import identityCardBackground from "$src/assets/identityCardBackground.png";
 import {
   AuthnTemplates,
   authenticateBox,
 } from "$src/components/authenticateBox";
 import { displayError } from "$src/components/displayError";
-import {
-  IdentityBackground,
-  identityCard,
-  loadIdentityBackground,
-} from "$src/components/identityCard";
+import { identityCard } from "$src/components/identityCard";
 import { withLoader } from "$src/components/loader";
 import { logoutSection } from "$src/components/logout";
 import { mainWindow } from "$src/components/mainWindow";
 import { toast } from "$src/components/toast";
-import { LEGACY_II_URL } from "$src/config";
+import { ENABLE_PIN_QUERY_PARAM_KEY, LEGACY_II_URL } from "$src/config";
+import { DOMAIN_COMPATIBILITY, OPENID_AUTHENTICATION } from "$src/featureFlags";
 import { addDevice } from "$src/flows/addDevice/manage/addDevice";
 import { dappsExplorer } from "$src/flows/dappsExplorer";
 import { KnownDapp, getDapps } from "$src/flows/dappsExplorer/dapps";
 import { dappsHeader, dappsTeaser } from "$src/flows/dappsExplorer/teaser";
+import { linkedAccountsSection } from "$src/flows/manage/linkedAccountsSection";
+import copyJson from "$src/flows/manage/linkedAccountsSection.json";
 import {
   TempKeyWarningAction,
   tempKeyWarningBox,
@@ -29,17 +33,33 @@ import {
 import { addPhrase, recoveryWizard } from "$src/flows/recovery/recoveryWizard";
 import { setupKey, setupPhrase } from "$src/flows/recovery/setupRecovery";
 import { I18n } from "$src/i18n";
+import { getCredentialsOrigin } from "$src/utils/credential-devices";
 import { AuthenticatedConnection, Connection } from "$src/utils/iiConnection";
 import { TemplateElement, renderPage } from "$src/utils/lit-html";
+import {
+  createAnonymousNonce,
+  createGoogleRequestConfig,
+  decodeJWT,
+  isPermissionError,
+  requestJWT,
+} from "$src/utils/openID";
+import { PreLoadImage } from "$src/utils/preLoadImage";
 import {
   isProtected,
   isRecoveryDevice,
   isRecoveryPhrase,
 } from "$src/utils/recoveryDevice";
-import { OmitParams, shuffleArray, unreachable } from "$src/utils/utils";
+import { userSupportsWebauthRoR } from "$src/utils/rorSupport";
+import {
+  OmitParams,
+  isCanisterError,
+  shuffleArray,
+  unreachable,
+} from "$src/utils/utils";
 import { Principal } from "@dfinity/principal";
 import { isNullish, nonNullish } from "@dfinity/utils";
 import { TemplateResult, html } from "lit-html";
+import { registerCurrentDeviceCurrentOrigin } from "../addDevice/registerCurrentDeviceCurrentOrigin";
 import { authenticatorsSection } from "./authenticatorsSection";
 import {
   deleteDevice,
@@ -57,44 +77,37 @@ export const authnTemplateManage = ({
 }: {
   dapps: KnownDapp[];
 }): AuthnTemplates => {
-  const wrap = ({
-    title,
-    subtitle,
-    showDapps = false,
-  }: {
-    title: TemplateElement;
-    subtitle?: string;
-    showDapps?: boolean;
-  }): TemplateResult => html`
-    ${showDapps ? dappsHeader({ dapps, clickable: false }) : undefined}
-    <header class="l-stack">
-      <h1 class="t-title t-title--main">${title}</h1>
-      ${nonNullish(subtitle)
-        ? html` <p class="t-lead l-stack">${subtitle}</p>`
-        : undefined}
-    </header>
-  `;
+  const title = (title: string) =>
+    html`<h1 class="t-title t-title--main">${title}</h1>`;
+
+  const subtitle = (subtitle: string) =>
+    html`<p class="t-lead l-stack">${subtitle}</p>`;
+
   return {
     firstTime: {
-      slot: wrap({
-        title: "Securely connect to dapps on the Internet Computer",
-        showDapps: true,
-      }),
+      slot: html`
+        ${dappsHeader({ dapps, clickable: false })}
+        <header class="l-stack">
+          ${title("Securely connect to dapps on the Internet Computer")}
+        </header>
+      `,
       useExistingText: "Use existing",
       createAnchorText: "Create Internet Identity",
     },
     useExisting: {
-      slot: wrap({
-        title: html`Enter your <br />Internet Identity`,
-        subtitle: "to continue",
-      }),
+      slot: html`
+        <header class="l-stack">
+          ${title("Enter Identity 🔑")} ${subtitle("to continue")}
+        </header>
+      `,
     },
 
     pick: {
-      slot: wrap({
-        title: html`Choose your <br />Internet Identity`,
-        subtitle: "to continue",
-      }),
+      slot: html`
+        <header>
+          ${title("Choose Identity 🔑")} ${subtitle("to continue")}
+        </header>
+      `,
     },
   };
 };
@@ -104,17 +117,30 @@ export const authFlowManage = async (connection: Connection) => {
   const i18n = new I18n();
   const dapps = shuffleArray(getDapps());
 
-  const identityBackground = loadIdentityBackground();
+  const params = new URLSearchParams(window.location.search);
+  const allowPinRegistration = params.get(ENABLE_PIN_QUERY_PARAM_KEY) !== null;
+
+  const identityBackground = new PreLoadImage(identityCardBackground);
   // Go through the login flow, potentially creating an anchor.
   const {
     userNumber,
     connection: authenticatedConnection,
     newAnchor,
+    showAddCurrentDevice,
   } = await authenticateBox({
     connection,
     i18n,
     templates: authnTemplateManage({ dapps }),
+    allowPinLogin: true,
+    allowPinRegistration,
   });
+
+  if (showAddCurrentDevice && DOMAIN_COMPATIBILITY.isEnabled()) {
+    await registerCurrentDeviceCurrentOrigin(
+      userNumber,
+      authenticatedConnection
+    );
+  }
 
   // Here, if the user is returning & doesn't have any recovery device, we prompt them to add
   // one. The exact flow depends on the device they use.
@@ -150,6 +176,9 @@ const displayManageTemplate = ({
   onAddDevice,
   addRecoveryPhrase,
   addRecoveryKey,
+  credentials,
+  onLinkAccount,
+  onUnlinkAccount,
   dapps,
   exploreDapps,
   identityBackground,
@@ -160,9 +189,12 @@ const displayManageTemplate = ({
   onAddDevice: () => void;
   addRecoveryPhrase: () => void;
   addRecoveryKey: () => void;
+  credentials: OpenIdCredential[];
+  onLinkAccount: () => void;
+  onUnlinkAccount: (credential: OpenIdCredential) => void;
   dapps: KnownDapp[];
   exploreDapps: () => void;
-  identityBackground: IdentityBackground;
+  identityBackground: PreLoadImage;
   tempKeysWarning?: TempKeyWarningAction;
 }): TemplateResult => {
   // Nudge the user to add a passkey if there is none
@@ -177,16 +209,6 @@ const displayManageTemplate = ({
     ${nonNullish(tempKeysWarning)
       ? tempKeyWarningBox({ i18n, warningAction: tempKeysWarning })
       : ""}
-    <p class="t-paragraph">
-      ${dappsTeaser({
-        dapps,
-        click: () => exploreDapps(),
-        copy: {
-          dapps_explorer: "Dapps explorer",
-          sign_into_dapps: "Connect to these dapps",
-        },
-      })}
-    </p>
     ${pinAuthenticators.length > 0
       ? tempKeysSection({ authenticators: pinAuthenticators, i18n })
       : ""}
@@ -195,7 +217,25 @@ const displayManageTemplate = ({
       onAddDevice,
       warnNoPasskeys,
     })}
+    ${OPENID_AUTHENTICATION.isEnabled()
+      ? linkedAccountsSection({
+          credentials,
+          onLinkAccount,
+          onUnlinkAccount,
+          hasOtherAuthMethods: authenticators.length > 0,
+        })
+      : ""}
     ${recoveryMethodsSection({ recoveries, addRecoveryPhrase, addRecoveryKey })}
+    <aside class="l-stack">
+      ${dappsTeaser({
+        dapps,
+        click: () => exploreDapps(),
+        copy: {
+          dapps_explorer: "Dapps explorer",
+          sign_into_dapps: "Connect to these dapps",
+        },
+      })}
+    </aside>
     ${logoutSection()}
   </section>`;
 
@@ -209,7 +249,7 @@ const anchorSection = ({
   identityBackground,
 }: {
   userNumber: bigint;
-  identityBackground: IdentityBackground;
+  identityBackground: PreLoadImage;
 }): TemplateResult => html`
   <aside class="l-stack">
     <div
@@ -227,7 +267,7 @@ export const renderManageWarmup = (): OmitParams<
   typeof renderManage,
   "identityBackground"
 > => {
-  const identityBackground = loadIdentityBackground();
+  const identityBackground = new PreLoadImage(identityCardBackground);
   return async (opts) => {
     return await renderManage({ ...opts, identityBackground });
   };
@@ -241,7 +281,7 @@ export const renderManage = async ({
 }: {
   userNumber: bigint;
   connection: AuthenticatedConnection;
-  identityBackground: IdentityBackground;
+  identityBackground: PreLoadImage;
 }): Promise<never> => {
   let connection = origConnection;
 
@@ -250,6 +290,8 @@ export const renderManage = async ({
   for (;;) {
     let anchorInfo: IdentityAnchorInfo;
     try {
+      // Ignore the `commitMetadata` response, it's not critical for the application.
+      void connection.commitMetadata();
       anchorInfo = await withLoader(() => connection.getAnchorInfo());
     } catch (error: unknown) {
       await displayFailedToListDevices(
@@ -259,7 +301,7 @@ export const renderManage = async ({
     }
     if (anchorInfo.device_registration.length !== 0) {
       // we are actually in a device registration process
-      await addDevice({ userNumber, connection });
+      await addDevice({ userNumber, connection, origin: window.origin });
       continue;
     }
 
@@ -268,6 +310,7 @@ export const renderManage = async ({
       userNumber,
       connection,
       anchorInfo.devices,
+      anchorInfo.openid_credentials[0] ?? [],
       identityBackground
     );
     connection = newConnection ?? connection;
@@ -292,22 +335,37 @@ function isPinAuthenticated(
   );
 }
 
-export const displayManage = (
+export const displayManage = async (
   userNumber: bigint,
   connection: AuthenticatedConnection,
-  devices_: DeviceData[],
-  identityBackground: IdentityBackground
+  devices_: DeviceWithUsage[],
+  credentials: OpenIdCredential[],
+  identityBackground: PreLoadImage
 ): Promise<void | AuthenticatedConnection> => {
+  const i18n = new I18n();
+  const copy = i18n.i18n(copyJson);
+
   // Fetch the dapps used in the teaser & explorer
   // (dapps are suffled to encourage discovery of new dapps)
   const dapps = shuffleArray(getDapps());
+
+  // Create anonymous nonce and salt for connection principal
+  const { nonce, salt } = await createAnonymousNonce(
+    connection.identity.getPrincipal()
+  );
+
+  const googleClientId =
+    connection.canisterConfig.openid_google[0]?.[0]?.client_id;
+
   return new Promise((resolve) => {
-    const devices = devicesFromDeviceDatas({
+    const devices = devicesFromDevicesWithUsage({
       devices: devices_,
       userNumber,
       connection,
       reload: resolve,
+      hasOtherAuthMethods: credentials.length > 0,
     });
+
     if (devices.dupPhrase) {
       toast.error(
         "More than one recovery phrases are registered, which is unexpected. Only one will be shown."
@@ -320,7 +378,17 @@ export const displayManage = (
     }
 
     const onAddDevice = async () => {
-      await addDevice({ userNumber, connection });
+      const newDeviveOrigin =
+        userSupportsWebauthRoR() && DOMAIN_COMPATIBILITY.isEnabled()
+          ? getCredentialsOrigin({
+              credentials: devices_,
+            })
+          : undefined;
+      await addDevice({
+        userNumber,
+        connection,
+        origin: newDeviveOrigin ?? window.origin,
+      });
       resolve();
     };
     const addRecoveryPhrase = async () => {
@@ -330,8 +398,106 @@ export const displayManage = (
         return;
       }
       doAdd satisfies "ok";
-      await setupPhrase(userNumber, connection);
+      // Recovery phrase doesn't need ROR, this is for consistency reasons.
+      const newDeviceOrigin = DOMAIN_COMPATIBILITY.isEnabled()
+        ? getCredentialsOrigin({
+            credentials: devices_,
+          })
+        : undefined;
+      await setupPhrase(
+        userNumber,
+        connection,
+        newDeviceOrigin ?? window.origin
+      );
       resolve();
+    };
+
+    const onLinkAccount = async () => {
+      if (isNullish(googleClientId)) {
+        toast.error(copy.linking_google_accounts_is_unavailable);
+        return;
+      }
+      try {
+        const jwt = await withLoader(() =>
+          requestJWT(createGoogleRequestConfig(googleClientId), {
+            mediation: "required",
+            nonce,
+          })
+        );
+        const { iss, sub } = decodeJWT(jwt);
+        if (credentials.find((c) => c.iss === iss && c.sub === sub)) {
+          toast.error(copy.account_already_linked);
+          return;
+        }
+        await connection.addOpenIdCredential(jwt, salt);
+        resolve();
+      } catch (error) {
+        if (isPermissionError(error)) {
+          toast.error(copy.third_party_sign_in_permission_required);
+          return;
+        }
+        if (isCanisterError<OpenIdCredentialAddError>(error)) {
+          switch (error.type) {
+            case "Unauthorized":
+              toast.error(copy.authentication_failed);
+              console.error(
+                `Authentication unexpectedly failed: ${error
+                  .value(error.type)
+                  .toText()}`
+              );
+              break;
+            case "JwtVerificationFailed":
+              toast.error(copy.jwt_signature_invalid);
+              break;
+            case "OpenIdCredentialAlreadyRegistered":
+              toast.error(copy.account_already_linked);
+              break;
+            case "InternalCanisterError":
+              toast.error(`Unexpected error: ${error.value(error.type)}`);
+              break;
+            default: {
+              // Make sure all error cases are covered,
+              // else this will throw a TS error here.
+              const _ = error.type satisfies never;
+            }
+          }
+          return;
+        }
+        throw error;
+      }
+    };
+    const onUnlinkAccount = async (credential: OpenIdCredential) => {
+      if (!confirm(copy.unlink_account_confirmation.toString())) {
+        return;
+      }
+      try {
+        await connection.removeOpenIdCredential(credential.iss, credential.sub);
+        resolve();
+      } catch (error) {
+        if (isCanisterError<OpenIdCredentialRemoveError>(error)) {
+          switch (error.type) {
+            case "Unauthorized":
+              toast.error(copy.authentication_failed);
+              console.error(
+                `Authentication unexpectedly failed: ${error
+                  .value(error.type)
+                  .toText()}`
+              );
+              break;
+            case "OpenIdCredentialNotFound":
+              toast.error(copy.account_not_found);
+              break;
+            case "InternalCanisterError":
+              toast.error(`Unexpected error: ${error.value(error.type)}`);
+              break;
+            default: {
+              // Make sure all error cases are covered,
+              // else this will throw a TS error here.
+              const _ = error.type satisfies never;
+            }
+          }
+        }
+      }
     };
 
     // Function to figure out what temp keys warning should be shown, if any.
@@ -366,16 +532,12 @@ export const displayManage = (
         onAddDevice,
         addRecoveryPhrase,
         addRecoveryKey: async () => {
-          const confirmed = confirm(
-            "Add a Recovery Device\n\nUse a FIDO Security Key, like a YubiKey, as an additional recovery method."
-          );
-          if (!confirmed) {
-            // No resolve here because we don't need to reload the screen
-            return;
-          }
           await setupKey({ connection });
           resolve();
         },
+        credentials,
+        onLinkAccount,
+        onUnlinkAccount,
         dapps,
         exploreDapps: async () => {
           await dappsExplorer({ dapps });
@@ -447,16 +609,19 @@ export const readRecovery = ({
 
 // Convert devices read from the canister into types that are easier to work with
 // and that better represent what we expect.
-export const devicesFromDeviceDatas = ({
+// Exported for testing purposes
+export const devicesFromDevicesWithUsage = ({
   devices: devices_,
   reload,
   connection,
   userNumber,
+  hasOtherAuthMethods,
 }: {
-  devices: DeviceData[];
+  devices: DeviceWithUsage[];
   reload: (connection?: AuthenticatedConnection) => void;
   connection: AuthenticatedConnection;
   userNumber: bigint;
+  hasOtherAuthMethods: boolean;
 }): Devices & { dupPhrase: boolean; dupKey: boolean } => {
   const hasSingleDevice = devices_.length <= 1;
 
@@ -482,11 +647,14 @@ export const devicesFromDeviceDatas = ({
 
       const authenticator = {
         alias: device.alias,
+        last_usage: device.last_usage,
         warn: domainWarning(device),
+        info: domainInfo(device, devices_),
         rename: () => renameDevice({ connection, device, reload }),
-        remove: hasSingleDevice
-          ? undefined
-          : () => deleteDevice({ connection, device, reload }),
+        remove:
+          hasSingleDevice && !hasOtherAuthMethods
+            ? undefined
+            : () => deleteDevice({ connection, device, reload }),
       };
 
       if ("browser_storage_key" in device.key_type) {
@@ -510,6 +678,9 @@ export const devicesFromDeviceDatas = ({
 export const domainWarning = (
   device: DeviceData
 ): TemplateResult | undefined => {
+  if (DOMAIN_COMPATIBILITY.isEnabled()) {
+    return undefined;
+  }
   // Recovery phrases are not FIDO devices, meaning they are not tied to a particular origin (unless most authenticators like TouchID, etc, and e.g. recovery _devices_ in the case of YubiKeys and the like)
   if (isRecoveryPhrase(device)) {
     return undefined;
@@ -520,27 +691,47 @@ export const domainWarning = (
     device.origin.length === 0 ? undefined : device.origin[0];
 
   // If this is the _old_ II (ic0.app) and no origin was recorded, then we can't infer much and don't show a warning.
-  if (window.origin === LEGACY_II_URL && isNullish(deviceOrigin)) {
+  if (window.location.origin === LEGACY_II_URL && isNullish(deviceOrigin)) {
     return undefined;
   }
 
   // If this is the _old_ II (ic0.app) and the device has an origin that is _not_ ic0.app, then the device was probably migrated and can't be used on ic0.app anymore.
-  if (window.origin === LEGACY_II_URL && deviceOrigin !== window.origin) {
+  if (
+    window.location.origin === LEGACY_II_URL &&
+    deviceOrigin !== window.location.origin
+  ) {
     return html`This Passkey may not be usable on the current URL
-    (${window.origin})`;
+    (${window.location.origin})`;
   }
 
   // In general, if this is _not_ the _old_ II, then it's most likely the _new_ II, meaning all devices should have an origin attached.
   if (isNullish(deviceOrigin)) {
     return html`This Passkey may not be usable on the current URL
-    (${window.origin})`;
+    (${window.location.origin})`;
   }
 
   // Finally, in general if the device has an origin but this is not _this_ origin, we issue a warning
-  if (deviceOrigin !== window.origin) {
+  if (deviceOrigin !== window.location.origin) {
     return html`This Passkey may not be usable on the current URL
-    (${window.origin})`;
+    (${window.location.origin})`;
   }
+};
+
+const domainInfo = (
+  device: DeviceData,
+  allDevices: DeviceData[]
+): TemplateResult | undefined => {
+  if (!DOMAIN_COMPATIBILITY.isEnabled()) {
+    return undefined;
+  }
+  const commonOrigin = getCredentialsOrigin({
+    credentials: allDevices,
+  });
+  if (nonNullish(commonOrigin)) {
+    return undefined;
+  }
+  return html`This passkey was registered in
+  ${device.origin[0] ?? LEGACY_II_URL}`;
 };
 
 const unknownError = (): Error => {

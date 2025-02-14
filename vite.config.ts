@@ -1,13 +1,15 @@
 import {
   compression,
-  injectCanisterIdPlugin,
-  integrityPlugin,
+  injectCanisterIdAndConfigPlugin,
+  inlineScriptsPlugin,
   minifyHTML,
   replicaForwardPlugin,
 } from "@dfinity/internet-identity-vite-plugins";
+import { readReplicaPort } from "@dfinity/internet-identity-vite-plugins/utils";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 import { resolve } from "path";
 import { AliasOptions, UserConfig, defineConfig } from "vite";
+import { nodePolyfills } from "vite-plugin-node-polyfills";
 
 export const aliasConfig: AliasOptions = {
   // Polyfill stream for the browser. e.g. needed in "Recovery Phrase" features.
@@ -18,7 +20,7 @@ export const aliasConfig: AliasOptions = {
   $showcase: resolve(__dirname, "src/showcase/src"),
 };
 
-export default defineConfig(({ mode }: UserConfig): UserConfig => {
+export default defineConfig(({ command, mode }): UserConfig => {
   // Expand process.env variables with default values to ensure build reproducibility
   process.env = {
     ...process.env,
@@ -54,8 +56,10 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
         output: {
           entryFileNames: `[name].js`,
           // II canister only supports resources that contains a single dot in their filenames. qr-creator.js.gz = ok. qr-creator.min.js.gz not ok. qr-creator.es6.min.js.gz no ok.
-          chunkFileNames: ({ name }) => `${name.replace(/.es6|.min/gm, "")}.js`,
-          assetFileNames: `[name].[ext]`,
+          chunkFileNames: (chunkInfo) =>
+            `${chunkInfo.name.replace(/.es6|.min/gm, "")}-[hash]-cacheable.js`,
+
+          assetFileNames: `[name]-[hash]-cacheable.[ext]`,
         },
       },
       commonjsOptions: {
@@ -64,32 +68,49 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
       },
     },
     plugins: [
-      integrityPlugin,
+      inlineScriptsPlugin,
+      // Needed to support WebAuthnIdentity in this repository due to borc dependency.
+      nodePolyfills({
+        include: ["buffer"],
+      }),
       [
         ...(mode === "development"
-          ? [injectCanisterIdPlugin({ canisterName: "internet_identity" })]
+          ? [
+              injectCanisterIdAndConfigPlugin({
+                canisterName: "internet_identity",
+              }),
+            ]
           : []),
       ],
       [...(mode === "production" ? [minifyHTML(), compression()] : [])],
       [...(process.env.TLS_DEV_SERVER === "1" ? [basicSsl()] : [])],
-      replicaForwardPlugin({
-        replicaOrigin: "127.0.0.1:4943",
-        forwardDomains: ["icp0.io", "ic0.app"],
-        forwardRules: [
-          {
-            hosts: ["nice-name.com"],
-            canisterName: "test_app",
-          },
-          ...(process.env.NO_HOT_RELOAD === "1"
-            ? [
-                {
-                  hosts: ["identity.ic0.app", "identity.internetcomputer.org"],
-                  canisterName: "internet_identity",
-                },
-              ]
-            : []),
-        ],
-      }),
+      {
+        ...replicaForwardPlugin({
+          forwardDomains: ["icp0.io", "ic0.app"],
+          forwardRules: [
+            {
+              hosts: ["nice-name.com"],
+              canisterName: "test_app",
+            },
+            {
+              hosts: ["nice-issuer-custom-orig.com"],
+              canisterName: "issuer",
+            },
+            ...(process.env.NO_HOT_RELOAD === "1"
+              ? [
+                  {
+                    hosts: [
+                      "identity.ic0.app",
+                      "identity.internetcomputer.org",
+                    ],
+                    canisterName: "internet_identity",
+                  },
+                ]
+              : []),
+          ],
+        }),
+        apply: "serve",
+      },
     ],
     optimizeDeps: {
       esbuildOptions: {
@@ -98,11 +119,32 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
         },
       },
     },
-    server: {
-      https: process.env.TLS_DEV_SERVER === "1",
-      proxy: {
-        "/api": "http://127.0.0.1:4943",
-      },
-    },
+    server:
+      command !== "serve"
+        ? {}
+        : {
+            https: process.env.TLS_DEV_SERVER === "1" ? {} : undefined,
+            proxy: {
+              "/api": `http://127.0.0.1:${readReplicaPort()}`,
+            },
+            allowedHosts: ["icp-api.io"],
+            cors: {
+              origin: [
+                "https://identity.internetcomputer.org",
+                "https://identity.ic0.app",
+                "https://nice-name.com",
+                "https://nice-issuer-custom-orig.com",
+                "https://be2us-64aaa-aaaaa-qaabq-cai.icp0.io",
+                // Test app
+                "https://bd3sg-teaaa-aaaaa-qaaba-cai.icp0.io",
+                // Test app
+                "https://bd3sg-teaaa-aaaaa-qaaba-cai.ic0.app",
+                // Issuer
+                "https://bkyz2-fmaaa-aaaaa-qaaaq-cai.icp0.io",
+                // Issuer
+                "https://bkyz2-fmaaa-aaaaa-qaaaq-cai.ic0.app",
+              ],
+            },
+          },
   };
 });

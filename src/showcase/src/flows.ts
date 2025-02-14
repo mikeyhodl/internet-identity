@@ -1,9 +1,30 @@
+import {
+  _SERVICE,
+  InternetIdentityInit,
+} from "$generated/internet_identity_types";
 import { authenticateBoxFlow } from "$src/components/authenticateBox";
 import { withLoader } from "$src/components/loader";
 import { toast } from "$src/components/toast";
 import { registerFlow, RegisterFlowOpts } from "$src/flows/register";
+import { AuthenticatedConnection } from "$src/utils/iiConnection";
+import { MultiWebAuthnIdentity } from "$src/utils/multiWebAuthnIdentity";
+import { ActorSubclass } from "@dfinity/agent";
+import { DelegationIdentity } from "@dfinity/identity";
 import { html, render, TemplateResult } from "lit-html";
-import { dummyChallenge, i18n, manageTemplates } from "./showcase";
+import { dummyChallenge } from "./constants";
+import { i18n } from "./i18n";
+import { manageTemplates } from "./templates";
+
+const DEFAULT_INIT: InternetIdentityInit = {
+  analytics_config: [],
+  archive_config: [],
+  assigned_user_number_range: [],
+  canister_creation_cycles_cost: [],
+  captcha_config: [],
+  openid_google: [],
+  register_rate_limit: [],
+  related_origins: [],
+};
 
 const registerSuccessToastTemplate = (result: unknown) => html`
   Identity successfully created!<br />
@@ -24,21 +45,70 @@ export const flowsPage = () => {
   render(pageContent, container);
 };
 
-const registerFlowOpts: RegisterFlowOpts<null> = {
-  createChallenge: async () => {
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    return dummyChallenge;
+const mockDelegationIdentity = {} as DelegationIdentity;
+const mockActor = {
+  identity_info: () => {
+    return {
+      Ok: {
+        authn_methods: [],
+        metadata: [],
+        authn_method_registration: [],
+      },
+    };
   },
-  register: async ({ challengeResult: { chars } }) => {
+} as unknown as ActorSubclass<_SERVICE>;
+
+class MockAuthenticatedConnection extends AuthenticatedConnection {
+  constructor() {
+    super(
+      "12345",
+      DEFAULT_INIT,
+      MultiWebAuthnIdentity.fromCredentials([], undefined, undefined),
+      mockDelegationIdentity,
+      BigInt(12345),
+      mockActor
+    );
+  }
+
+  setShownRecoveryWarningPage = async (): Promise<void> => {
+    // Do nothing
+  };
+}
+
+const mockConnection = new MockAuthenticatedConnection();
+
+const registerFlowOpts: RegisterFlowOpts = {
+  identityRegistrationStart: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    return {
+      kind: "registrationFlowStepSuccess",
+      nextStep: {
+        step: "checkCaptcha",
+        captcha_png_base64: dummyChallenge.png_base64,
+      },
+    };
+  },
+  checkCaptcha: async (solution: string) => {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    if (solution !== "8wJ6Q") {
+      return {
+        kind: "wrongCaptchaSolution",
+        new_captcha_png_base64: dummyChallenge.png_base64,
+      };
+    }
+    return {
+      kind: "registrationFlowStepSuccess",
+      nextStep: { step: "finish" },
+    };
+  },
+  identityRegistrationFinish: async () => {
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
-    if (chars !== "8wJ6Q") {
-      return { kind: "badChallenge" };
-    }
     return {
       kind: "loginSuccess",
       userNumber: BigInt(12356),
-      connection: null,
+      connection: mockConnection,
+      showAddCurrentDevice: false,
     };
   },
   registrationAllowed: true,
@@ -52,47 +122,50 @@ const registerFlowOpts: RegisterFlowOpts<null> = {
 
 export const iiFlows: Record<string, () => void> = {
   loginManage: async () => {
-    const result = await authenticateBoxFlow<null, "identity">({
+    const result = await authenticateBoxFlow<"identity">({
       i18n,
       templates: manageTemplates,
       addDevice: () => {
         toast.info(html`Added device`);
-        return Promise.resolve({ alias: "My Device" });
+        return Promise.resolve({
+          tag: "deviceAdded",
+          alias: "My Device",
+        });
       },
       loginPasskey: async () => {
         await new Promise((resolve) => setTimeout(resolve, 2000));
         toast.info(html`Logged in`);
         return Promise.resolve({
-          tag: "ok",
+          kind: "loginSuccess",
           userNumber: BigInt(1234),
-          connection: null,
+          connection: mockConnection,
+          showAddCurrentDevice: false,
         });
       },
+      allowPinLogin: true,
       loginPinIdentityMaterial: async ({ pin }) => {
         toast.info(html`Valid PIN is '123456'`);
         await withLoader(
           () => new Promise((resolve) => setTimeout(resolve, 2000))
         );
         if (pin !== "123456") {
-          return Promise.resolve({
-            tag: "err",
-            title: "Invalid PIN",
-            message: "Invalid PIN",
-          });
+          return Promise.resolve({ kind: "badPin" });
         }
         toast.info(html`Logged in`);
         return Promise.resolve({
-          tag: "ok",
+          kind: "loginSuccess",
           userNumber: BigInt(1234),
-          connection: null,
+          connection: mockConnection,
+          showAddCurrentDevice: false,
         });
       },
       recover: () => {
         toast.info(html`Recovered`);
         return Promise.resolve({
-          tag: "ok",
+          kind: "loginSuccess",
           userNumber: BigInt(1234),
-          connection: null,
+          connection: mockConnection,
+          showAddCurrentDevice: false,
         });
       },
       retrievePinIdentityMaterial: ({ userNumber }) => {
@@ -127,11 +200,11 @@ export const iiFlows: Record<string, () => void> = {
     `);
   },
   register: async () => {
-    const result = await registerFlow<null>(registerFlowOpts);
+    const result = await registerFlow(registerFlowOpts);
     toast.success(registerSuccessToastTemplate(result));
   },
   registerWithPin: async () => {
-    const result = await registerFlow<null>({
+    const result = await registerFlow({
       ...registerFlowOpts,
       pinAllowed: () => Promise.resolve(true),
     });

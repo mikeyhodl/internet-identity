@@ -1,11 +1,14 @@
 use crate::ii_domain::IIDomain;
+use crate::openid::{OpenIdCredential, OpenIdCredentialKey};
+use crate::storage::stable_anchor::StableAnchor;
 use crate::storage::storable_anchor::StorableAnchor;
 use crate::{IC0_APP_ORIGIN, INTERNETCOMPUTER_ORG_ORIGIN};
 use candid::{CandidType, Deserialize, Principal};
 use internet_identity_interface::archive::types::DeviceDataWithoutAlias;
+use internet_identity_interface::internet_identity::types::openid::OpenIdCredentialData;
 use internet_identity_interface::internet_identity::types::*;
 use std::collections::HashMap;
-use std::{fmt, iter};
+use std::fmt;
 
 #[cfg(test)]
 mod tests;
@@ -18,6 +21,7 @@ mod tests;
 pub struct Anchor {
     anchor_number: AnchorNumber,
     devices: Vec<Device>,
+    openid_credentials: Vec<OpenIdCredential>,
     metadata: Option<HashMap<String, MetadataEntry>>,
 }
 
@@ -99,20 +103,58 @@ impl From<Device> for DeviceDataWithoutAlias {
     }
 }
 
-impl From<Anchor> for StorableAnchor {
-    fn from(anchor: Anchor) -> Self {
+impl From<OpenIdCredential> for OpenIdCredentialData {
+    fn from(openid_credential: OpenIdCredential) -> Self {
         Self {
-            devices: anchor.devices,
-            metadata: anchor.metadata,
+            iss: openid_credential.iss,
+            sub: openid_credential.sub,
+            aud: openid_credential.aud,
+            last_usage_timestamp: openid_credential.last_usage_timestamp,
+            metadata: openid_credential.metadata,
         }
     }
 }
 
-impl From<(AnchorNumber, StorableAnchor)> for Anchor {
-    fn from((anchor_number, storable_anchor): (AnchorNumber, StorableAnchor)) -> Self {
+impl From<OpenIdCredentialData> for OpenIdCredential {
+    fn from(openid_credential: OpenIdCredentialData) -> Self {
+        Self {
+            iss: openid_credential.iss,
+            sub: openid_credential.sub,
+            aud: openid_credential.aud,
+            last_usage_timestamp: openid_credential.last_usage_timestamp,
+            metadata: openid_credential.metadata,
+        }
+    }
+}
+
+impl From<Anchor> for (StorableAnchor, StableAnchor) {
+    fn from(anchor: Anchor) -> Self {
+        (
+            StorableAnchor {
+                devices: anchor.devices,
+                metadata: anchor.metadata,
+            },
+            StableAnchor {
+                openid_credentials: anchor.openid_credentials,
+            },
+        )
+    }
+}
+
+impl From<(AnchorNumber, StorableAnchor, Option<StableAnchor>)> for Anchor {
+    fn from(
+        (anchor_number, storable_anchor, stable_anchor): (
+            AnchorNumber,
+            StorableAnchor,
+            Option<StableAnchor>,
+        ),
+    ) -> Self {
         Anchor {
             anchor_number,
             devices: storable_anchor.devices,
+            openid_credentials: stable_anchor
+                .map(|anchor| anchor.openid_credentials)
+                .unwrap_or_default(),
             metadata: storable_anchor.metadata,
         }
     }
@@ -125,6 +167,7 @@ impl Anchor {
         Self {
             anchor_number,
             devices: vec![],
+            openid_credentials: vec![],
             metadata: None,
         }
     }
@@ -140,11 +183,11 @@ impl Anchor {
             });
         }
         check_device_invariants(&device)?;
-        check_anchor_invariants(
-            &self.devices.iter().chain(iter::once(&device)).collect(),
-            &self.metadata,
-        )?;
-        self.devices.push(device);
+        // Check the new set of devices is consistent
+        let mut devices = self.devices.clone();
+        devices.push(device);
+        check_anchor_invariants(&devices[..], &self.metadata)?;
+        self.devices = devices;
         Ok(())
     }
 
@@ -174,21 +217,17 @@ impl Anchor {
             return Err(AnchorError::CannotModifyDeviceKey);
         }
         check_device_invariants(&modified_device)?;
+        // Ensure the old device can be mutated
         let index = self.device_index(device_key)?;
         check_mutation_allowed(&self.devices[index])?;
-        check_anchor_invariants(
-            &self
-                .devices
-                .iter()
-                // filter out the device before modification
-                .filter(|e| e.pubkey != device_key)
-                // append the device with modification
-                .chain(iter::once(&modified_device))
-                .collect(),
-            &self.metadata,
-        )?;
 
-        self.devices[index] = modified_device;
+        // Check the new set of devices is consistent
+        let mut devices = self.devices.clone();
+        devices[index] = modified_device;
+        check_anchor_invariants(&devices[..], &self.metadata)?;
+
+        // Replace devices
+        self.devices = devices;
         Ok(())
     }
 
@@ -297,6 +336,50 @@ impl Anchor {
         }
     }
 
+    /// Returns a reference to the list of OpenID credentials.
+    pub fn openid_credentials(&self) -> &Vec<OpenIdCredential> {
+        &self.openid_credentials
+    }
+
+    fn openid_credential_index(&self, key: &OpenIdCredentialKey) -> Result<usize, AnchorError> {
+        self.openid_credentials
+            .iter()
+            .position(|entry| &entry.key() == key)
+            .ok_or(AnchorError::OpenIdCredentialNotFound)
+    }
+
+    pub fn add_openid_credential(
+        &mut self,
+        openid_credential: OpenIdCredential,
+    ) -> Result<(), AnchorError> {
+        if self
+            .openid_credential_index(&openid_credential.key())
+            .is_ok()
+        {
+            return Err(AnchorError::OpenIdCredentialAlreadyRegistered);
+        }
+        self.openid_credentials.push(openid_credential);
+        Ok(())
+    }
+
+    pub fn remove_openid_credential(
+        &mut self,
+        key: &OpenIdCredentialKey,
+    ) -> Result<(), AnchorError> {
+        let index = self.openid_credential_index(key)?;
+        self.openid_credentials.remove(index);
+        Ok(())
+    }
+
+    pub fn update_openid_credential(
+        &mut self,
+        openid_credential: OpenIdCredential,
+    ) -> Result<(), AnchorError> {
+        let index = self.openid_credential_index(&openid_credential.key())?;
+        self.openid_credentials[index] = openid_credential;
+        Ok(())
+    }
+
     /// Returns a reference to the optional identity metadata map
     /// (which is independent of devices / authentication methods).
     pub fn identity_metadata(&self) -> &Option<HashMap<String, MetadataEntry>> {
@@ -310,7 +393,7 @@ impl Anchor {
         metadata: HashMap<String, MetadataEntry>,
     ) -> Result<(), AnchorError> {
         let metadata = Some(metadata);
-        check_anchor_invariants(&self.devices.iter().collect(), &metadata)?;
+        check_anchor_invariants(&self.devices[..], &metadata)?;
         self.metadata = metadata;
         Ok(())
     }
@@ -416,13 +499,13 @@ fn caller() -> Principal {
 /// To allow that transition, [remove_device](Anchor::remove_device) does _not_ check the invariants based on the assumption
 /// that the state of an anchor cannot get worse by removing a device.
 fn check_anchor_invariants(
-    devices: &Vec<&Device>,
+    devices: &[Device],
     identity_metadata: &Option<HashMap<String, MetadataEntry>>,
 ) -> Result<(), AnchorError> {
     /// The number of devices is limited. The front-end limits the devices further
     /// by only allowing 8 devices with purpose `authentication` to make sure there is always
     /// a slot for the recovery devices.
-    /// Note however, that a free device slot does not guarantee that it will fit the the anchor
+    /// Note however, that a free device slot does not guarantee that it will fit the anchor
     /// due to the `VARIABLE_FIELDS_LIMIT`.
     const MAX_DEVICES_PER_ANCHOR: usize = 10;
 
@@ -519,7 +602,7 @@ fn check_device_limits(device: &Device) -> Result<(), AnchorError> {
     const ORIGIN_LEN_LIMIT: usize = 50;
     const ALIAS_LEN_LIMIT: usize = 64;
     const PK_LEN_LIMIT: usize = 300;
-    const CREDENTIAL_ID_LEN_LIMIT: usize = 200;
+    const CREDENTIAL_ID_LEN_LIMIT: usize = 350;
 
     let n = device.alias.len();
     if n > ALIAS_LEN_LIMIT {
@@ -598,6 +681,8 @@ pub enum AnchorError {
     DuplicateDevice {
         device_key: DeviceKey,
     },
+    OpenIdCredentialAlreadyRegistered,
+    OpenIdCredentialNotFound,
     ReservedMetadataKey {
         key: String,
     },
@@ -635,7 +720,9 @@ impl fmt::Display for AnchorError {
             AnchorError::NotFound { device_key } => write!(f, "Device with key {} not found.", hex::encode(device_key)),
             AnchorError::DuplicateDevice { device_key } => write!(f, "Device with key {} already exists on this anchor.", hex::encode(device_key)),
             AnchorError::ReservedMetadataKey { key } => write!(f, "Metadata key '{}' is reserved and cannot be used.", key),
-            AnchorError::RecoveryPhraseCredentialIdMismatch => write!(f, "Devices with key type seed_phrase must not have a credential id.")
+            AnchorError::RecoveryPhraseCredentialIdMismatch => write!(f, "Devices with key type seed_phrase must not have a credential id."),
+            AnchorError::OpenIdCredentialAlreadyRegistered => write!(f, "OpenID credential has already been registered on this or another anchor."),
+            AnchorError::OpenIdCredentialNotFound => write!(f, "OpenID credential not found."),
         }
     }
 }

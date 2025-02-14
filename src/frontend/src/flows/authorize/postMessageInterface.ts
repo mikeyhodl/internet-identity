@@ -1,5 +1,6 @@
 // Types and functions related to the window post message interface used by
 // applications that want to authenticate the user using Internet Identity
+import { Principal } from "@dfinity/principal";
 import { z } from "zod";
 import { Delegation } from "./fetchDelegation";
 
@@ -7,6 +8,10 @@ import { Delegation } from "./fetchDelegation";
 export const AuthReady = {
   kind: "authorize-ready",
 };
+
+// If the relying party hasn't sent a request in 10 seconds, we should assume
+// something went wrong and that we're likely aren't going to receive any.
+const TIMEOUT_WAIT_FOR_REQUEST = 10000;
 
 /**
  * All information required to process an authentication request received from
@@ -22,6 +27,17 @@ export interface AuthContext {
    */
   requestOrigin: string;
 }
+
+const zodPrincipal = z.string().transform((val, ctx) => {
+  let principal;
+  try {
+    principal = Principal.fromText(val);
+  } catch {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Not a principal " });
+    return z.NEVER;
+  }
+  return principal;
+});
 
 export const AuthRequest = z.object({
   kind: z.literal("authorize-client"),
@@ -40,6 +56,8 @@ export const AuthRequest = z.object({
       return val;
     }),
   derivationOrigin: z.optional(z.string()),
+  allowPinAuthentication: z.optional(z.boolean()),
+  autoSelectionPrincipal: z.optional(zodPrincipal),
 });
 
 export type AuthRequest = z.output<typeof AuthRequest>;
@@ -53,6 +71,7 @@ export type AuthResponse =
       kind: "authorize-client-success";
       delegations: Delegation[];
       userPublicKey: Uint8Array;
+      authnMethod: "pin" | "passkey" | "recovery";
     };
 
 /**
@@ -67,16 +86,25 @@ export async function authenticationProtocol({
     authRequest: AuthRequest;
     requestOrigin: string;
   }) => Promise<
-    | { kind: "success"; delegations: Delegation[]; userPublicKey: Uint8Array }
+    | {
+        kind: "success";
+        delegations: Delegation[];
+        userPublicKey: Uint8Array;
+        authnMethod: "pin" | "passkey" | "recovery";
+      }
     | { kind: "failure"; text: string }
   >;
   /* Progress update messages to let the user know what's happening. */
   onProgress: (state: "waiting" | "validating") => void;
-}): Promise<"orphan" | "success" | "failure"> {
+}): Promise<"orphan" | "closed" | "invalid" | "success" | "failure"> {
   if (window.opener === null) {
-    // If there's no `window.opener` a user has manually navigated to "/#authorize".
-    // Signal that there will never be an authentication request incoming.
-    return "orphan";
+    if (window.history.length > 1) {
+      // If there's no `window.opener` and a user has manually navigated to "/#authorize".
+      // Signal that there will never be an authentication request incoming.
+      return "orphan";
+    }
+    // Else signal that the connection has been unexpectedly closed.
+    return "closed";
   }
 
   // Send a message to indicate we're ready.
@@ -87,28 +115,39 @@ export async function authenticationProtocol({
 
   onProgress("waiting");
 
-  const { origin, request } = await waitForRequest();
-  const authContext = { authRequest: request, requestOrigin: origin };
+  const requestResult = await waitForRequest();
+  if (requestResult.kind === "timeout") {
+    return "closed";
+  }
+  if (requestResult.kind === "invalid") {
+    return "invalid";
+  }
+  void (requestResult.kind satisfies "received");
+
+  const authContext = {
+    authRequest: requestResult.request,
+    requestOrigin: requestResult.origin,
+  };
 
   onProgress("validating");
 
-  const result = await authenticate(authContext);
+  const authenticateResult = await authenticate(authContext);
 
-  if (result.kind === "failure") {
+  if (authenticateResult.kind === "failure") {
     window.opener.postMessage({
       kind: "authorize-client-failure",
-      text: result.text,
+      text: authenticateResult.text,
     } satisfies AuthResponse);
     return "failure";
   }
-
-  result.kind satisfies "success";
+  void (authenticateResult.kind satisfies "success");
 
   window.opener.postMessage(
     {
       kind: "authorize-client-success",
-      delegations: result.delegations,
-      userPublicKey: result.userPublicKey,
+      delegations: authenticateResult.delegations,
+      userPublicKey: authenticateResult.userPublicKey,
+      authnMethod: authenticateResult.authnMethod,
     } satisfies AuthResponse,
     authContext.requestOrigin
   );
@@ -117,26 +156,49 @@ export async function authenticationProtocol({
 }
 
 // Wait for a request to kickstart the flow
-const waitForRequest = (): Promise<{
-  request: AuthRequest;
-  origin: string;
-}> => {
+const waitForRequest = (): Promise<
+  | {
+      kind: "received";
+      request: AuthRequest;
+      origin: string;
+    }
+  | { kind: "timeout" }
+  | { kind: "invalid" }
+> => {
   return new Promise((resolve) => {
-    const messageEventHandler = (evnt: MessageEvent) => {
-      const message: unknown = evnt.data;
+    const timeout = setTimeout(
+      () => resolve({ kind: "timeout" }),
+      TIMEOUT_WAIT_FOR_REQUEST
+    );
+    const messageEventHandler = (event: MessageEvent) => {
+      if (event.origin === window.location.origin) {
+        // Ignore messages from own origin (e.g. from browser extensions)
+        console.warn("Ignoring message from own origin", event);
+        return;
+      }
+      const message: unknown = event.data;
       const result = AuthRequest.safeParse(message);
 
       if (!result.success) {
         const message = `Unexpected error: flow request ` + result.error;
         console.error(message);
-        // XXX: here we just wait further assuming the opener might recover
-        // and send a correct request
+
+        // The relying party is not made aware that the request is invalid,
+        // so we should assume the relying party will wait forever.
+        //
+        // Let's at least indicate to the user that the request was invalid,
+        // so they can communicate this with the relying party developer.
+        clearTimeout(timeout);
+        window.removeEventListener("message", messageEventHandler);
+
+        resolve({ kind: "invalid" });
         return;
       }
 
+      clearTimeout(timeout);
       window.removeEventListener("message", messageEventHandler);
 
-      resolve({ request: result.data, origin: evnt.origin });
+      resolve({ kind: "received", request: result.data, origin: event.origin });
     };
 
     // Set up an event listener for receiving messages from the client.
