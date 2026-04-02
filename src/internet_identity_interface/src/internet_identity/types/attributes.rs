@@ -21,6 +21,17 @@ pub enum AttributeName {
     VerifiedEmail,
 }
 
+impl AttributeName {
+    /// Returns all known attribute name variants.
+    pub const fn all() -> &'static [AttributeName] {
+        &[
+            AttributeName::Email,
+            AttributeName::Name,
+            AttributeName::VerifiedEmail,
+        ]
+    }
+}
+
 impl TryFrom<&str> for AttributeName {
     type Error = String;
 
@@ -678,6 +689,63 @@ pub enum GetIcrc3AttributeError {
     AuthorizationError(Principal),
     GetAccountError(GetAccountError),
     NoSuchSignature,
+}
+
+// ── List available attributes ───────────────────────────────────────────────
+
+#[derive(CandidType, Debug, Deserialize)]
+pub struct ListAvailableAttributesRequest {
+    pub identity_number: AnchorNumber,
+    pub attributes: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+pub struct ValidatedListAvailableAttributesRequest {
+    pub identity_number: AnchorNumber,
+    pub attributes: Option<Vec<AttributeKey>>,
+}
+
+impl TryFrom<ListAvailableAttributesRequest> for ValidatedListAvailableAttributesRequest {
+    type Error = ListAvailableAttributesError;
+
+    fn try_from(request: ListAvailableAttributesRequest) -> Result<Self, Self::Error> {
+        let mut problems = Vec::new();
+
+        let attributes = match request.attributes {
+            None => None,
+            Some(keys) => {
+                if keys.len() > MAX_ATTRIBUTES_PER_REQUEST {
+                    problems.push(format!(
+                        "Too many attributes: {} (max {})",
+                        keys.len(),
+                        MAX_ATTRIBUTES_PER_REQUEST
+                    ));
+                }
+                let mut parsed = Vec::with_capacity(keys.len().min(MAX_ATTRIBUTES_PER_REQUEST));
+                for key in keys {
+                    match AttributeKey::try_from(key) {
+                        Ok(k) => parsed.push(k),
+                        Err(e) => problems.push(e),
+                    }
+                }
+                if !problems.is_empty() {
+                    return Err(ListAvailableAttributesError::ValidationError { problems });
+                }
+                Some(parsed)
+            }
+        };
+
+        Ok(ValidatedListAvailableAttributesRequest {
+            identity_number: request.identity_number,
+            attributes,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum ListAvailableAttributesError {
+    ValidationError { problems: Vec<String> },
+    AuthorizationError(Principal),
 }
 
 #[cfg(test)]
@@ -1829,6 +1897,83 @@ mod tests {
                     }
                     other => panic!("Expected validation error for {}, got {:?}", label, other),
                 }
+            }
+        }
+    }
+
+    mod validated_list_available_attributes_request_tests {
+        use super::*;
+
+        #[test]
+        fn test_valid_requests() {
+            // None means all attributes
+            let req = ListAvailableAttributesRequest {
+                identity_number: 10000,
+                attributes: None,
+            };
+            let validated = ValidatedListAvailableAttributesRequest::try_from(req).unwrap();
+            assert!(validated.attributes.is_none());
+
+            // Empty vec
+            let req = ListAvailableAttributesRequest {
+                identity_number: 10000,
+                attributes: Some(vec![]),
+            };
+            let validated = ValidatedListAvailableAttributesRequest::try_from(req).unwrap();
+            pretty_assert_eq!(validated.attributes.unwrap().len(), 0);
+
+            // Scoped key
+            let req = ListAvailableAttributesRequest {
+                identity_number: 10000,
+                attributes: Some(vec!["openid:https://accounts.google.com:email".to_string()]),
+            };
+            let validated = ValidatedListAvailableAttributesRequest::try_from(req).unwrap();
+            let attrs = validated.attributes.unwrap();
+            pretty_assert_eq!(attrs.len(), 1);
+            assert!(attrs[0].scope.is_some());
+
+            // Unscoped key — valid for list (unlike prepare)
+            let req = ListAvailableAttributesRequest {
+                identity_number: 10000,
+                attributes: Some(vec!["email".to_string()]),
+            };
+            let validated = ValidatedListAvailableAttributesRequest::try_from(req).unwrap();
+            let attrs = validated.attributes.unwrap();
+            pretty_assert_eq!(attrs.len(), 1);
+            assert!(attrs[0].scope.is_none());
+            pretty_assert_eq!(attrs[0].attribute_name, AttributeName::Email);
+        }
+
+        #[test]
+        fn test_invalid_requests() {
+            // Too many attributes
+            let req = ListAvailableAttributesRequest {
+                identity_number: 10000,
+                attributes: Some(
+                    (0..MAX_ATTRIBUTES_PER_REQUEST + 1)
+                        .map(|_| "email".to_string())
+                        .collect(),
+                ),
+            };
+            let err = ValidatedListAvailableAttributesRequest::try_from(req).unwrap_err();
+            match err {
+                ListAvailableAttributesError::ValidationError { problems } => {
+                    assert!(problems[0].contains("Too many attributes"));
+                }
+                other => panic!("Expected ValidationError, got {:?}", other),
+            }
+
+            // Invalid key
+            let req = ListAvailableAttributesRequest {
+                identity_number: 10000,
+                attributes: Some(vec!["unknown_attribute".to_string()]),
+            };
+            let err = ValidatedListAvailableAttributesRequest::try_from(req).unwrap_err();
+            match err {
+                ListAvailableAttributesError::ValidationError { problems } => {
+                    assert!(problems[0].contains("Unknown attribute"));
+                }
+                other => panic!("Expected ValidationError, got {:?}", other),
             }
         }
     }
